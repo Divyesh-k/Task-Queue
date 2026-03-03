@@ -1,6 +1,40 @@
 [package]
-name = "Task-Queue"
+name = "task-queue"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+
+[[bin]]
+name = "task-queue"
+path = "src/main.rs"
 
 [dependencies]
+# Async runtime
+tokio      = { version = "1", features = ["full"] }
+
+# Serialization — WAL records are encoded as binary with bincode
+serde      = { version = "1", features = ["derive"] }
+bincode    = { version = "2", features = ["serde"] }
+serde_json = "1"
+
+# Checksums — each WAL record has a CRC32 to detect corruption
+crc32fast = "1"
+
+# Error handling
+thiserror = "1"
+anyhow    = "1"
+
+# Logging
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Unique task IDs
+uuid  = { version = "1", features = ["v4", "serde"] }
+
+# Timestamps
+chrono = { version = "0.4", features = ["serde"] }
+
+# Randomness (backoff jitter)
+rand = "0.8"
+
+# Config file parsing
+toml = "0.8"
