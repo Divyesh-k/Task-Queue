@@ -1,39 +1,29 @@
-//! Task-Queue — entry point.
+//! Task-Queue — entry point / demo runner.
 //!
-//! Right now this file is a **runnable demo of the WAL module**.
-//! It shows you exactly what happens when tasks are written, how we
-//! recover from a simulated crash, and how a checkpoint is created.
+//! Each time we finish a module we update this file to demo the new feature.
 //!
-//! Run it with:
-//!   cargo run
-//!
-//! You will see all WAL events printed to the console, and the
-//! files `data/wal.log` and `data/wal.log.snapshot` created on disk.
+//! Current demo: Queue Module
+//! Run with:  cargo run
 
 mod error;
+mod queue;
 mod task;
 mod wal;
 
-use std::collections::HashMap;
-
 use tracing::info;
-use uuid::Uuid;
 
 use crate::error::WalResult;
-use crate::task::Task;
-use crate::wal::{Wal, WalEvent};
+use crate::queue::TaskQueue;
+use crate::wal::Wal;
 
-// ── Constants ────────────────────────────────────────────────
 const WAL_PATH: &str = "./data/wal.log";
-
-/// Number of entries before auto-checkpoint fires in the demo.
-/// Set very low (3) so you can see a checkpoint happen quickly.
-const CHECKPOINT_INTERVAL: usize = 3;
+const MAX_CAPACITY: usize = 10;
+const CHECKPOINT_INTERVAL: usize = 5;
+const BASE_DELAY_MS: u64 = 100;
 
 #[tokio::main]
 async fn main() -> WalResult<()> {
-    // Set up pretty log output.
-    // RUST_LOG=debug cargo run  ← shows every WAL record written
+    // Pretty log output. Set RUST_LOG=debug for verbose WAL-level logs.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -41,128 +31,186 @@ async fn main() -> WalResult<()> {
         )
         .init();
 
-    info!("=== Task Queue WAL Demo ===\n");
+    info!("=== Task Queue — Queue Module Demo ===\n");
 
-    // ─────────────────────────────────────────────────────────
-    // PHASE 1: Submit some tasks and write them to the WAL
-    // ─────────────────────────────────────────────────────────
-    info!("--- Phase 1: Submitting tasks ---");
+    // ── Open WAL + build Queue ────────────────────────────────────────────────
+    //
+    // TaskQueue::new() calls wal.recover() internally.
+    // If data/wal.log exists from a previous run, tasks are restored
+    // automatically — you don't need to do anything special.
+    let wal = Wal::open(WAL_PATH, CHECKPOINT_INTERVAL).await?;
+    let queue = TaskQueue::new(wal, MAX_CAPACITY).await?;
 
-    // This is our in-memory state — a map of task ID → Task.
-    // In the full system this will live inside the Queue struct.
-    let mut in_memory: HashMap<Uuid, Task> = HashMap::new();
+    info!(
+        "Queue ready. Capacity: {}  Pending: {}\n",
+        MAX_CAPACITY,
+        queue.pending_count().await
+    );
 
-    // Open (or create) the WAL file.
-    let mut wal = Wal::open(WAL_PATH, CHECKPOINT_INTERVAL).await?;
+    // ─────────────────────────────────────────────────────────────────────────
+    // PHASE 1 — Push tasks with different priorities
+    //
+    // Notice: we push them in order 1, 5, 3, 2, 4
+    // After push(), the queue sorts them as 5, 4, 3, 2, 1
+    // Workers always pop the highest priority first.
+    // ─────────────────────────────────────────────────────────────────────────
+    info!("--- Phase 1: Pushing 5 tasks (priorities 1,5,3,2,4) ---");
 
-    // Create 5 tasks and record each one to the WAL.
-    let mut task_ids: Vec<Uuid> = Vec::new();
+    let mut task_ids = Vec::new();
 
-    for i in 1..=5 {
-        // Create a new task with a simple text payload.
-        let task = Task::new(
-            format!("task-payload-{}", i).into_bytes(), // payload
-            i as u8,                                    // priority
-            3,                                          // max retries
-        );
-        let task_id = task.id;
-        task_ids.push(task_id);
-
-        info!(task_id = %task_id, priority = i, "Submitting task");
-
-        // 🔑 KEY STEP: Write to disk FIRST, then add to memory.
-        // This ordering is what "Write-Ahead" means.
-        wal.append(WalEvent::TaskSubmitted(task.clone()), &in_memory)
+    for priority in [1u8, 5, 3, 2, 4] {
+        let task_id = queue
+            .push(
+                format!("do-work-priority-{}", priority).into_bytes(),
+                priority,
+                3, // max 3 retries before dead-lettering
+            )
             .await?;
-        in_memory.insert(task_id, task);
 
-        info!(queue_len = in_memory.len(), "Task added to in-memory queue");
-    }
-
-    // ─────────────────────────────────────────────────────────
-    // PHASE 2: Mark some tasks as started and completed
-    // ─────────────────────────────────────────────────────────
-    info!("\n--- Phase 2: Processing tasks ---");
-
-    // Start task 0
-    let t0 = task_ids[0];
-    info!(task_id = %t0, "Worker starting task");
-    wal.append(WalEvent::TaskStarted { task_id: t0 }, &in_memory)
-        .await?;
-    wal::apply_event(&mut in_memory, WalEvent::TaskStarted { task_id: t0 });
-
-    // Complete task 0
-    info!(task_id = %t0, "Worker completed task");
-    wal.append(WalEvent::TaskCompleted { task_id: t0 }, &in_memory)
-        .await?;
-    wal::apply_event(&mut in_memory, WalEvent::TaskCompleted { task_id: t0 });
-
-    // Fail task 1
-    let t1 = task_ids[1];
-    info!(task_id = %t1, "Worker failed task (attempt 1)");
-    wal.append(
-        WalEvent::TaskFailed {
-            task_id: t1,
-            attempt: 1,
-        },
-        &in_memory,
-    )
-    .await?;
-    wal::apply_event(
-        &mut in_memory,
-        WalEvent::TaskFailed {
-            task_id: t1,
-            attempt: 1,
-        },
-    );
-
-    // ─────────────────────────────────────────────────────────
-    // PHASE 3: Simulate a crash by dropping everything and recovering
-    // ─────────────────────────────────────────────────────────
-    info!("\n--- Phase 3: Simulating crash + recovery ---");
-
-    // Drop in-memory state — gone!
-    drop(in_memory);
-    // Drop WAL handle — file is closed.
-    drop(wal);
-
-    info!("💥 Server crashed! RAM lost, but WAL file is safe on disk.");
-    info!("Restarting and recovering from WAL...\n");
-
-    // Reopen the WAL — this is the server restarting.
-    let mut wal = Wal::open(WAL_PATH, CHECKPOINT_INTERVAL).await?;
-
-    // Recovery replays every record from disk and rebuilds the task map.
-    let recovered = wal.recover().await?;
-
-    info!(
-        "\n✅ Recovery complete! Tasks recovered: {}",
-        recovered.len()
-    );
-    info!("\n--- Recovered task states ---");
-
-    // Print each recovered task's status so you can see the result.
-    let mut sorted: Vec<_> = recovered.values().collect();
-    sorted.sort_by_key(|t| t.submitted_at);
-
-    for task in sorted {
+        task_ids.push(task_id);
         info!(
-            id       = %task.id,
-            status   = ?task.status,
-            priority = task.priority,
-            attempt  = task.attempt,
-            "Recovered task"
+            priority,
+            task_id = %task_id,
+            queue_len = queue.pending_count().await,
+            "✅ Pushed task"
         );
     }
 
-    info!("\n=== Demo complete ===");
-    info!("Check these files on disk:");
-    info!("  WAL log:    {}", WAL_PATH);
-    info!("  Snapshot:   {}.snapshot", WAL_PATH);
+    // ─────────────────────────────────────────────────────────────────────────
+    // PHASE 2 — Pop tasks (should come out in priority order: 5, 4, 3, 2, 1)
+    //
+    // pop() finds the first Pending task whose retry_after has passed.
+    // It records TaskStarted in the WAL, sets status=Running, returns the task.
+    // ─────────────────────────────────────────────────────────────────────────
+    info!("\n--- Phase 2: Workers popping tasks (expect order 5,4,3,2,1) ---");
+
+    let mut popped = Vec::new();
+    while let Some(task) = queue.pop().await? {
+        info!(
+            priority  = task.priority,
+            task_id   = %task.id,
+            status    = ?task.status,
+            "📦 Worker popped task"
+        );
+        popped.push(task);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // PHASE 3 — Complete some, fail others
+    //
+    // complete() → WAL records TaskCompleted, task removed from queue
+    // fail()     → WAL records TaskFailed, task stays in queue with
+    //              status=Pending and retry_after set (exponential backoff)
+    // ─────────────────────────────────────────────────────────────────────────
+    info!("\n--- Phase 3: Completing and failing tasks ---");
+
+    // Complete the first 2 tasks (highest priority ones: 5, 4)
+    for task in popped.iter().take(2) {
+        queue.complete(task.id).await?;
+        info!(
+            priority = task.priority,
+            task_id  = %task.id,
+            "✅ Task completed"
+        );
+    }
+
+    // Fail task #3 (priority=3) — it will be retried
+    if let Some(task) = popped.get(2) {
+        queue.fail(task.id, BASE_DELAY_MS).await?;
+        info!(
+            priority = task.priority,
+            task_id  = %task.id,
+            "❌ Task failed — retry scheduled with backoff"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // PHASE 4 — Exhaust retries → Dead Letter Queue
+    //
+    // We repeatedly fail the same task until its attempt count exceeds
+    // max_retries (3). On the 4th failure it gets dead-lettered.
+    // ─────────────────────────────────────────────────────────────────────────
+    info!("\n--- Phase 4: Exhausting retries → Dead Letter Queue ---");
+
+    // Use the last task in our list (priority=1, max_retries=3)
+    let dlq_task_id = *task_ids.last().unwrap();
+
+    // Pop it so it's in Running state
+    // (We set retry_after=None by calling fail until we dead-letter it)
+    // Instead, bypass pop() for demo: push a fresh task with max_retries=1
+    let disposable_id = queue
+        .push(b"this-will-dlq".to_vec(), 1, 1) // max_retries = 1
+        .await?;
+    info!(task_id = %disposable_id, "Pushed disposable task (max_retries=1)");
+
+    // Pop it into Running state
+    if let Some(t) = queue.pop().await? {
+        // Fail it twice — second fail pushes attempt(2) > max_retries(1) → DLQ
+        queue.fail(t.id, BASE_DELAY_MS).await?; // attempt=1, retries left=0
+        info!("Attempt 1 failed — one retry left");
+
+        // We need to pop again for attempt 2, but retry_after is set.
+        // For the demo we manually call fail again (simulating time passing).
+        // In the real system workers wait for retry_after before popping.
+        queue.fail(t.id, BASE_DELAY_MS).await?; // attempt=2, exceeds max=1 → DLQ
+        info!("Attempt 2 failed — max retries exceeded → Dead Letter Queue");
+    }
+
+    let _ = dlq_task_id; // suppress unused warning
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // PHASE 5 — Inspect DLQ and final queue state
+    // ─────────────────────────────────────────────────────────────────────────
+    info!("\n--- Phase 5: Final queue state ---");
+
+    info!("  Pending tasks  : {}", queue.pending_count().await);
+    info!("  Dead-lettered  : {}", queue.dead_letter_count().await);
+
+    info!("\n  Dead Letter Queue contents:");
+    for task in queue.dead_letter_tasks().await {
+        info!(
+            task_id  = %task.id,
+            priority = task.priority,
+            attempts = task.attempt,
+            "  ☠  DLQ task"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // PHASE 6 — Backpressure demo
+    //
+    // Fill the queue to MAX_CAPACITY, then try to push one more.
+    // The 11th push should return Err(QueueFull).
+    // ─────────────────────────────────────────────────────────────────────────
     info!(
-        "\nThe checkpoint fired after every {} writes.",
-        CHECKPOINT_INTERVAL
+        "\n--- Phase 6: Backpressure (capacity = {}) ---",
+        MAX_CAPACITY
     );
+
+    // Fill remaining slots
+    let pending_now = queue.pending_count().await;
+    let slots_left = MAX_CAPACITY.saturating_sub(pending_now);
+
+    for i in 0..slots_left {
+        queue.push(format!("fill-{}", i).into_bytes(), 1, 0).await?;
+    }
+
+    info!("Queue filled to capacity ({})", queue.pending_count().await);
+
+    // Now try to push one more — should be rejected
+    match queue.push(b"overflow".to_vec(), 1, 0).await {
+        Err(crate::error::AppError::QueueFull { capacity }) => {
+            info!(
+                "🚫 Backpressure triggered: queue full at {} tasks. Push rejected!",
+                capacity
+            );
+        }
+        Ok(_) => info!("(unexpected: push succeeded)"),
+        Err(e) => info!("Unexpected error: {}", e),
+    }
+
+    info!("\n=== Queue Module Demo Complete ===");
+    info!("Data files: {} and {}.snapshot", WAL_PATH, WAL_PATH);
 
     Ok(())
 }
