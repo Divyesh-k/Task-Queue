@@ -1,11 +1,18 @@
 //! Task-Queue — entry point.
 //!
-//! Current demo: Protocol Module
-//! Shows the full encode → wire bytes → decode round-trip for every message type.
+//! Current demo: Broker Module — full live TCP server + client
 //!
 //! Run:  cargo run
-//! Run tests: cargo test  (codec unit tests run too)
+//!
+//! What you'll see:
+//!   1. Broker binds on 127.0.0.1:7777
+//!   2. Worker pool starts (4 workers)
+//!   3. A simulated client connects over TCP and sends 5 Submit frames
+//!   4. Broker replies with Ack (task accepted) or Reject (queue full)
+//!   5. Workers pick up tasks, execute them, complete/fail as usual
+//!   6. After 4 seconds, graceful shutdown
 
+mod broker;
 mod error;
 mod protocol;
 mod queue;
@@ -13,16 +20,26 @@ mod task;
 mod wal;
 mod worker;
 
+use std::time::Duration;
+
 use bytes::BytesMut;
-use tokio_util::codec::{Decoder, Encoder};
+use futures::{SinkExt, StreamExt};
+use tokio::net::TcpStream;
+use tokio_util::codec::Framed;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+use crate::broker::{Broker, BrokerConfig};
 use crate::error::WalResult;
 use crate::protocol::{
-    frame::MessageType,
-    message::{AckMsg, CompleteMsg, FailMsg, HeartbeatMsg, Message, RejectMsg, SubmitMsg},
+    message::{Message, SubmitMsg},
     TaskQueueCodec,
 };
+use crate::queue::TaskQueue;
+use crate::wal::Wal;
+
+const WAL_PATH: &str = "./data/wal.log";
+const BROKER_ADDR: &str = "127.0.0.1:7777";
 
 #[tokio::main]
 async fn main() -> WalResult<()> {
@@ -33,153 +50,115 @@ async fn main() -> WalResult<()> {
         )
         .init();
 
-    info!("=== Task Queue — Protocol Module Demo ===\n");
+    info!("=== Task Queue — Broker Module Demo ===\n");
+
+    // ── Build WAL + Queue ────────────────────────────────────────────────────
+    let wal = Wal::open(WAL_PATH, 10).await?;
+    let queue = TaskQueue::new(wal, 100).await?;
+
+    // ── Build Broker ─────────────────────────────────────────────────────────
+    let config = BrokerConfig {
+        listen_addr: BROKER_ADDR.into(),
+        worker_count: 4,
+        heartbeat_interval_secs: 2,
+        heartbeat_timeout_secs: 8,
+        base_delay_ms: 100,
+        simulated_failure_rate: 0.20, // 20% tasks randomly fail → retry
+    };
+
+    let broker = Broker::new(queue.clone(), config);
+    let token = CancellationToken::new();
+
+    // ── Spawn broker in the background ───────────────────────────────────────
+    // The broker runs its accept loop in a separate task so our main()
+    // can continue to connect a client.
+    let broker_token = token.clone();
+    tokio::spawn(async move {
+        if let Err(e) = broker.run(broker_token).await {
+            tracing::error!(error = %e, "Broker error");
+        }
+    });
+
+    // Give the broker a moment to bind and start listening.
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // ─────────────────────────────────────────────────────────────────────────
-    // The messages we'll encode
-    // Each variant represents one direction of communication in the system.
+    // SIMULATED CLIENT
+    //
+    // In a real system this would be an actual client application running on
+    // a different machine. Here we simulate it in the same process so you can
+    // see the full round-trip without needing a separate terminal.
     // ─────────────────────────────────────────────────────────────────────────
-    let messages = vec![
-        // Client → Broker: submit a new task
-        Message::Submit(SubmitMsg {
-            payload: b"process-invoice-42".to_vec(),
-            priority: 8,
-            max_retries: 3,
-        }),
-        // Broker → Client: task accepted
-        Message::Ack(AckMsg {
-            task_id: "550e8400-e29b-41d4-a716-446655440000".into(),
-        }),
-        // Broker → Client: queue full, rejected
-        Message::Reject(RejectMsg {
-            reason: "Queue capacity exceeded (10000 tasks)".into(),
-        }),
-        // Worker → Broker: heartbeat ping
-        Message::Heartbeat(HeartbeatMsg {
-            worker_id: "worker-2".into(),
-        }),
-        // Worker → Broker: task done
-        Message::Complete(CompleteMsg {
-            worker_id: "worker-2".into(),
-            task_id: "550e8400-e29b-41d4-a716-446655440000".into(),
-        }),
-        // Worker → Broker: task failed
-        Message::Fail(FailMsg {
-            worker_id: "worker-2".into(),
-            task_id: "550e8400-e29b-41d4-a716-446655440000".into(),
-            error: "Connection refused to downstream service".into(),
-        }),
+    info!("--- Simulated client connecting to {} ---\n", BROKER_ADDR);
+
+    let stream = TcpStream::connect(BROKER_ADDR).await?;
+    let mut framed = Framed::new(stream, TaskQueueCodec);
+
+    // Send 5 Submit messages with varying priorities
+    let tasks_to_submit = vec![
+        ("render-report", 9u8, 3u32),
+        ("send-email", 5, 2),
+        ("resize-image", 7, 3),
+        ("sync-database", 3, 1),
+        ("clean-cache", 1, 0),
     ];
 
-    info!("--- Round-trip demo for all 6 message types ---\n");
+    info!("Submitting {} tasks...\n", tasks_to_submit.len());
 
-    for msg in messages {
-        let label = format!("{:?}", msg_type_of(&msg));
+    for (name, priority, max_retries) in tasks_to_submit {
+        // Build and send the Submit frame
+        let submit_msg = Message::Submit(SubmitMsg {
+            payload: name.as_bytes().to_vec(),
+            priority,
+            max_retries,
+        });
 
-        // ── Step 1: Message → Frame ──────────────────────────────────
-        // `into_frame()` JSON-encodes the inner struct → payload bytes,
-        // wraps in Frame { message_type, payload }.
-        let frame = msg.clone().into_frame().expect("into_frame failed");
+        let frame = submit_msg.into_frame().expect("encode failed");
+        framed.send(frame).await.expect("send failed");
 
-        // ── Step 2: Frame → wire bytes ───────────────────────────────
-        // The codec writes: [0xDE 0xAD][type byte][length u32][payload]
-        let mut wire_buf = BytesMut::new();
-        TaskQueueCodec
-            .encode(frame.clone(), &mut wire_buf)
-            .expect("encode failed");
-
-        // ── Step 3: Show the wire bytes ──────────────────────────────
-        // Print as hex so you can see exactly what travels on the TCP socket.
-        let hex: Vec<String> = wire_buf.iter().map(|b| format!("{:02X}", b)).collect();
-
-        info!("Message type : {}", label);
-        info!("Payload JSON : {}", String::from_utf8_lossy(&frame.payload));
-        info!("Wire bytes   : {} bytes total", wire_buf.len());
-        let header_hex = hex[..7.min(hex.len())].join(" ");
-        let suffix = if hex.len() > 7 {
-            format!(" ... ({} payload bytes)", frame.payload.len())
-        } else {
-            String::new()
-        };
-        info!("Wire hex     : {}{}", header_hex, suffix);
-
-        // ── Step 4: Decode wire bytes back → Frame ───────────────────
-        // This is what the RECEIVER does — reads bytes off TCP, decodes.
-        let mut decode_buf = wire_buf.clone();
-        let decoded_frame = TaskQueueCodec
-            .decode(&mut decode_buf)
-            .expect("decode must not error")
-            .expect("must produce a frame");
-
-        // ── Step 5: Frame → typed Message ────────────────────────────
-        let decoded_msg = Message::from_frame(&decoded_frame).expect("from_frame failed");
-
-        // ── Verify roundtrip ─────────────────────────────────────────
-        assert_eq!(
-            decoded_frame.message_type, frame.message_type,
-            "message type must survive round-trip"
-        );
-        assert_eq!(
-            decoded_frame.payload, frame.payload,
-            "payload must survive round-trip"
-        );
-
-        info!("Decoded type : {:?}", decoded_frame.message_type);
-        info!("Round-trip   : ✅ OK\n");
-
-        let _ = decoded_msg; // used to prove decoding succeeded
+        // Wait for the broker's reply (Ack or Reject)
+        match framed.next().await {
+            Some(Ok(reply_frame)) => {
+                match Message::from_frame(&reply_frame).expect("decode reply") {
+                    Message::Ack(ack) => {
+                        info!(
+                            task = name, priority, max_retries,
+                            task_id = %ack.task_id,
+                            "  ✅ Broker replied: Ack"
+                        );
+                    }
+                    Message::Reject(rej) => {
+                        info!(
+                            task = name,
+                            reason = %rej.reason,
+                            "  🚫 Broker replied: Reject"
+                        );
+                    }
+                    other => tracing::warn!("Unexpected reply: {:?}", other),
+                }
+            }
+            Some(Err(e)) => tracing::error!(error = %e, "Frame decode error"),
+            None => tracing::warn!("Connection closed by broker"),
+        }
     }
 
+    info!("\n--- All tasks submitted. Workers are processing... ---");
+
+    // Let workers run for a few seconds so you can see processing output
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
     // ─────────────────────────────────────────────────────────────────────────
-    // Demo: partial frame simulation
-    //
-    // Show that the decoder correctly returns None when data is incomplete,
-    // and only returns Some(frame) once all bytes have arrived.
+    // GRACEFUL SHUTDOWN
     // ─────────────────────────────────────────────────────────────────────────
-    info!("--- Partial frame simulation ---");
-    info!("(Simulates TCP delivering bytes in two chunks)\n");
+    info!("\n--- Graceful shutdown ---");
+    token.cancel();
 
-    // Encode a HeartbeatMsg into a full wire buffer
-    let hb_frame = Message::Heartbeat(HeartbeatMsg {
-        worker_id: "worker-0".into(),
-    })
-    .into_frame()
-    .unwrap();
-    let mut full_buf = BytesMut::new();
-    TaskQueueCodec.encode(hb_frame, &mut full_buf).unwrap();
-    let total_bytes = full_buf.len();
+    // Give the shutdown a moment to propagate
+    tokio::time::sleep(Duration::from_millis(800)).await;
 
-    // Simulate receiving only the first 4 bytes (less than 7-byte header)
-    let mut partial = BytesMut::from(&full_buf[..4]);
-    let result = TaskQueueCodec.decode(&mut partial).unwrap();
-    info!(
-        "4 bytes received → decoder returned: {:?}",
-        result.map(|_| "Some(Frame)").unwrap_or("None")
-    );
-
-    // Now simulate receiving all bytes
-    let mut complete = full_buf;
-    let result = TaskQueueCodec.decode(&mut complete).unwrap();
-    info!(
-        "All {} bytes received → decoder returned: {}\n",
-        total_bytes,
-        result.map(|_| "Some(Frame) ✅").unwrap_or("None")
-    );
-
-    info!("=== Protocol Module Demo Complete ===");
-    info!("Run 'cargo test' to also run the 5 codec unit tests.");
+    info!("\n=== Broker Module Demo Complete ===");
+    info!("The full system is now working end-to-end:");
+    info!("  Client → TCP → Broker → Queue (WAL-backed) → Worker Pool → Done");
 
     Ok(())
-}
-
-/// Helper to get the MessageType from a Message for display.
-fn msg_type_of(msg: &Message) -> MessageType {
-    match msg {
-        Message::Submit(_) => MessageType::Submit,
-        Message::Ack(_) => MessageType::Ack,
-        Message::Reject(_) => MessageType::Reject,
-        Message::Heartbeat(_) => MessageType::Heartbeat,
-        Message::Complete(_) => MessageType::Complete,
-        Message::Fail(_) => MessageType::Fail,
-    }
 }
